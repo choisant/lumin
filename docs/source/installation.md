@@ -10,7 +10,7 @@ Full functionality requires two additional packages as described below.
 ## From source
 
 ```
-git clone git@github.com:GilesStrong/lumin.git
+git clone https://github.com/GilesStrong/lumin.git
 cd lumin
 pip install .
 ```
