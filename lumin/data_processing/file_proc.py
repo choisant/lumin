@@ -5,8 +5,11 @@ from typing import List, Union, Optional, Any, Tuple, Dict
 import os
 from pathlib import Path
 import json
+import awkward as ak
 
 from sklearn.model_selection import StratifiedKFold, KFold
+from awkward import Array as Array
+from pandas import DataFrame as DataFrame
 
 __all__ = ['save_to_grp', 'fold2foldfile', 'df2foldfile', 'add_meta_data']
 
@@ -23,7 +26,6 @@ def save_to_grp(arr:np.ndarray, grp:h5py.Group, name:str, compression:Optional[s
     '''
 
     # TODO Option for string length
-
     grp.create_dataset(name, shape=arr.shape, dtype=arr.dtype.name if arr.dtype.name not in ['object', 'str864'] else 'S64',
                        data=arr if arr.dtype.name not in ['object', 'str864'] else arr.astype('S64'), compression=compression)
 
@@ -52,7 +54,7 @@ def _build_matrix_lookups(feats:List[str], vecs:List[str], feats_per_vec:List[st
     return list(lookup.flatten()),missing.flatten(),shape
 
 
-def fold2foldfile(df:pd.DataFrame, out_file:h5py.File, fold_idx:int,
+def fold2foldfileold(df:pd.DataFrame, out_file:h5py.File, fold_idx:int,
                   cont_feats:List[str], cat_feats:List[str], targ_feats:Union[str,List[str]], targ_type:Any,
                   misc_feats:Optional[List[str]]=None, wgt_feat:Optional[str]=None,
                   matrix_lookup:Optional[List[str]]=None, matrix_missing:Optional[np.ndarray]=None, matrix_shape:Optional[Tuple[int,int]]=None,
@@ -106,6 +108,61 @@ def fold2foldfile(df:pd.DataFrame, out_file:h5py.File, fold_idx:int,
     elif tensor_data is not None:
         save_to_grp(tensor_data.astype('float32'), grp, 'matrix_inputs', compression=compression)
 
+def fold2foldfile(data, out_file:h5py.File, fold_idx:int,
+                  cont_feats:List[str], cat_feats:List[str], targ_feats:Union[str,List[str]], targ_type:Any,
+                  misc_feats:Optional[List[str]]=None, wgt_feat:Optional[str]=None, matrix_feats:Optional[List[str]]=None,
+                  tensor_feats:Optional[List[str]]=None, compression:Optional[str]=None) -> None:
+ 
+    grp = out_file.create_group(f'fold_{fold_idx}')
+
+    if type(data)==DataFrame:
+        save_to_grp(np.hstack((data[cont_feats].values.astype('float32'), data[cat_feats].values.astype('float32'))), grp, 'inputs', compression=compression)
+        save_to_grp(data[targ_feats].values.astype(targ_type), grp, 'targets', compression=compression)
+        if wgt_feat is not None: 
+            if wgt_feat in data.columns: save_to_grp(data[wgt_feat].values.astype('float32'), grp, 'weights', compression=compression)
+            else:                      print(f'{wgt_feat} not found in file')
+        if misc_feats is not None:
+            for f in misc_feats:
+                if f in data.columns: save_to_grp(data[f].values, grp, f, compression=compression)
+                else:               print(f'{f} not found in file')
+
+
+    elif type(data)==Array:
+        """
+        save_to_grp(np.hstack((np.array(ak.to_list([data[key] for key in cont_feats])).astype('float32').transpose(), 
+                    np.array(ak.to_list([data[key] for key in cat_feats])).astype('float32').transpose()))
+                    , grp, 'inputs', compression=compression)
+        """
+        save_to_grp(np.array(ak.to_list([data[key] for key in targ_feats])).astype(targ_type).transpose(), grp, 'targets', compression=compression)
+        if wgt_feat is not None: 
+            if wgt_feat in data.fields: save_to_grp(ak.to_numpy(data[wgt_feat]).astype('float32'), grp, 'weights', compression=compression)
+            else: print(f'{wgt_feat} not found in file') 
+
+        if misc_feats is not None:
+            for f in misc_feats:
+                if f in data.fields: save_to_grp(ak.to_list(data[f]), grp, f, compression=compression)
+                else: print(f'{f} not found in file')
+
+        if tensor_feats is not None: 
+        #Tensor feats should be on the form ["Clusters", ["pt", "eta", "phi"]] corresponding to ROOT lookup convention file.Clusters.pt for instance.
+            for f in tensor_feats:
+                if f[0] in data.fields:
+                    in_fields = np.array([key in data[f[0]].fields for key in f[1]])
+                    if(all(in_fields)):
+                        matrix_data = np.swapaxes(np.array([ak.to_list(data[f[0], key]) for key in f[1]]), 0, 1)
+                        save_to_grp(matrix_data, grp, f[0], compression=compression)
+                    else:
+                        idx = np.where(in_fields < 1)
+                        print(f'{[f[1][i] for i in idx]} not found in file')
+                else: print(f'{f} not found in file')
+
+        if matrix_feats is not None:
+            for f in matrix_feats:
+                if f in data.fields: save_to_grp(ak.to_list(data[f]), grp, f, compression=compression)
+                else: print(f'{f} not found in file')
+
+    else:
+        raise ValueError("The data provided does not correspond to a supported input format.")
 
 def df2foldfile(df:pd.DataFrame, n_folds:int, cont_feats:List[str], cat_feats:List[str],
                 targ_feats:Union[str,List[str]], savename:Union[Path,str], targ_type:str,
@@ -175,9 +232,45 @@ def df2foldfile(df:pd.DataFrame, n_folds:int, cont_feats:List[str], cat_feats:Li
                   matrix_vecs=matrix_vecs, matrix_feats_per_vec=matrix_feats_per_vec, matrix_row_wise=matrix_row_wise,
                   tensor_name=tensor_name, tensor_shp=tensor_data[0].shape if tensor_data is not None else None, tensor_is_sparse=tensor_is_sparse)
 
+def aarr2foldfile(aarr:ak.Array, n_folds:int,  
+                 targ_feats:Union[str, List[str]], savename:Union[Path, str], targ_type:str,
+                 strat_key:Optional[str]=None, misc_feats:Optional[List[str]]=None, wgt_feat:Optional[str]=None,
+                 matrix_feats:Optional[List[str]]=None, cont_feats:Optional[List[str]]=None, cat_feats:Optional[List[str]]=None,
+                 tensor_feats:Optional[List[str]]=None, cat_maps:Optional[Dict[str, Dict[int, Any]]]=None,
+                 compression:Optional[str]=None) -> None:
+
+    savename = str(savename)
+    os.system(f'rm {savename}.hdf5')
+    os.makedirs(savename[:savename.rfind('/')], exist_ok=True)
+    out_file = h5py.File(f'{savename}.hdf5', 'w')
+    lookup,missing,shape = None,None,None
+
+    if strat_key is not None and strat_key not in aarr.fields:
+        print(f'{strat_key} not found in Arrray')
+        strat_key = None
+
+    if strat_key is None:
+        kf = KFold(n_splits=n_folds, shuffle=True)
+        folds = kf.split(X=aarr)
+    else:
+        kf = StratifiedKFold(n_splits=n_folds, shuffle=True)
+        folds = kf.split(X=aarr, y=aarr[strat_key])
+    for fold_idx, (_, fold) in enumerate(folds):
+        print(f"Saving fold {fold_idx} with {len(fold)} events")
+        fold2foldfile(ak.copy(aarr[fold]), out_file, fold_idx, cont_feats=cont_feats, cat_feats=cat_feats, targ_feats=targ_feats,
+                      targ_type=targ_type, misc_feats=misc_feats, wgt_feat=wgt_feat,
+                      matrix_feats = matrix_feats, tensor_feats=tensor_feats,
+                      compression=compression)
+
+    add_meta_data(out_file=out_file, feats=aarr.fields, cont_feats=cont_feats, cat_feats=cat_feats, cat_maps=cat_maps, targ_feats=targ_feats, wgt_feat=wgt_feat,
+                  matrix_feats=matrix_feats, tensor_feats=tensor_feats)
+
+
+                
+                
 
 def add_meta_data(out_file:h5py.File, feats:List[str], cont_feats:List[str], cat_feats:List[str], cat_maps:Optional[Dict[str,Dict[int,Any]]],
-                  targ_feats:Union[str,List[str]], wgt_feat:Optional[str]=None,
+                  targ_feats:Union[str,List[str]], wgt_feat:Optional[str]=None, matrix_feats:Optional[str]=None, tensor_feats:Optional[str]=None,
                   matrix_vecs:Optional[List[str]]=None, matrix_feats_per_vec:Optional[List[str]]=None, matrix_row_wise:Optional[bool]=None,
                   tensor_name:Optional[str]=None, tensor_shp:Optional[Tuple[int]]=None, tensor_is_sparse:bool=False) -> None:
     r'''
@@ -207,6 +300,8 @@ def add_meta_data(out_file:h5py.File, feats:List[str], cont_feats:List[str], cat
     grp.create_dataset('cont_feats',   data=json.dumps(cont_feats))
     grp.create_dataset('cat_feats',    data=json.dumps(cat_feats))
     grp.create_dataset('targ_feats',   data=json.dumps(targ_feats))
+    grp.create_dataset('matrix_feats',   data=json.dumps(matrix_feats))
+    grp.create_dataset('tensor_feats',   data=json.dumps(tensor_feats))
     if wgt_feat is not None: grp.create_dataset('wgt_feat', data=json.dumps(wgt_feat))
     if cat_maps is not None: grp.create_dataset('cat_maps', data=json.dumps(cat_maps))
     if matrix_vecs is not None:
